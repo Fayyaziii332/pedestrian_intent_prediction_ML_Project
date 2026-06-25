@@ -7,7 +7,7 @@
 [![scikit-learn](https://img.shields.io/badge/scikit--learn-1.3-orange?logo=scikit-learn)](https://scikit-learn.org)
 [![Dataset](https://img.shields.io/badge/Dataset-JAAD%202.0-green)](https://data.nvision2.eecs.yorku.ca/JAAD_dataset/)
 [![Task](https://img.shields.io/badge/Task-Binary%20Classification-purple)]()
-[![Best F1](https://img.shields.io/badge/Best%20F1-0.9406-brightgreen)]()
+[![Best F1](https://img.shields.io/badge/Best%20F1-0.9400-brightgreen)]()
 
 ---
 
@@ -77,18 +77,22 @@ After cloning, download video clips from the official page and place them in `JA
 |---|---|---|---|---|
 | SVM (tuned) | 0.8976 | 0.8467 | 0.8813 | C=2.0, γ=0.2, RBF |
 | Random Forest (tuned) | 0.9246 | 0.8905 | 0.9125 | n=300, depth=12 |
-| Gradient Boosting (tuned) | 0.9400 | 0.9124 | 0.9354 | lr=0.12, n=150, depth=5 |
-| **Ensemble (soft-vote, val-weighted)** | **0.9406** | **0.9124** | **0.9168** | SVM+RF+GB |
+| **Gradient Boosting (tuned)** | **0.9400** | **0.9124** | **0.9354** | lr=0.12, n=150, depth=5 |
+| Gradient Boosting (regularised)* | 0.9163 | 0.8759 | 0.9102 | lr=0.10, n=100, depth=3, subsample=0.75 |
+| Ensemble (soft-vote, val-weighted)** | 0.9366 | 0.9051 | 0.9155 | SVM + RF + GB(regularised) |
 
-### Confusion Matrix — Best Model (Ensemble, test set = 137 samples)
+\* Built to address an apparent train/CV gap in the tuned GB's learning curve — see [Key Findings](#key-findings), point 3. It under-performs the original tuned GB on the held-out test set.
+\*\* The ensemble uses the **regularised** GB as its third member (chosen for lower variance), not the higher-scoring tuned GB above. As a result, the ensemble's F1 (0.9366) falls slightly **below** the best standalone model (tuned GB, 0.9400). The tuned GB is the model actually saved as `best_model_tuned.pkl`.
 
-```
-                 Predicted Stay    Predicted Cross
-Actual Stay           30                8           ← 8 false alarms
-Actual Cross           4               95           ← 4 missed (safety-critical)
+### Confusion Matrix — Best Standalone Model (Gradient Boosting, tuned, test set = 137 samples)
 
-False Negative rate on crossers: 4.0% (4/99)
-```
+| Model | TN | FP | FN | TP | Missed crossers | False alarms |
+|---|---|---|---|---|---|---|
+| Baseline SVM (default) | 30 | 8 | 5 | 94 | 5.1% (5/99) | 8 |
+| GB (regularised) | 27 | 11 | 6 | 93 | 6.1% (6/99) | 11 |
+| Ensemble (reg. GB, thr=0.58) | 30 | 8 | 5 | 94 | 5.1% (5/99) | 8 |
+
+Note: the final ensemble lands on **exactly the same** confusion matrix as the original baseline SVM. The regularised GB used inside the ensemble actually has *more* false negatives and false alarms on its own — the engineering and tuning effort mainly paid off in the **standalone tuned Gradient Boosting model** (not shown above with its own confusion matrix, but with F1=0.9400 it has the strongest balance of the four), not in the ensemble.
 
 ---
 
@@ -97,7 +101,7 @@ False Negative rate on crossers: 4.0% (4/99)
 ```
 pedestrian-intent-prediction/
 │
-├── Pedestrian_Intent_ML.ipynb    ← Main notebook (57 cells, 15 figures)
+├── Pedestrian_Intent_ML.ipynb    ← Main notebook (59 cells, 18 figures)
 ├── pedestrian_intent_prediction.py     ← Standalone Python script
 ├── README.md                           ← This file
 ```
@@ -222,13 +226,37 @@ Constrained search ranges anchored around known good parameters — deliberately
 
 ### 4. Ensemble
 
-Soft-voting ensemble with validation-F1-weighted votes:
+Soft-voting ensemble with validation-F1-weighted votes (uses the **regularised** GB as the third member, not the higher-scoring tuned GB):
 
 ```
-Weights: SVM=0.328  RF=0.335  GB=0.337
+Weights: SVM=0.330  RF=0.337  GB(regularised)=0.333
 Final probability = weighted average of class probabilities
-Decision threshold: 0.56 (optimised on validation set)
+Decision threshold: 0.58 (optimised on validation set) → Test F1 = 0.9353
+Default threshold (0.50)                                → Test F1 = 0.9366
 ```
+
+### 5. Gradient Boosting Regularisation Experiment
+
+The tuned GB's learning curve (train F1 → 1.0000) suggested possible overfitting, motivating a more conservative refit:
+
+| Parameter | Tuned (original) | Regularised (fixed) |
+|---|---|---|
+| `max_depth` | 5 | 3 |
+| `n_estimators` | 150 | 100 |
+| `learning_rate` | 0.12 | 0.10 |
+| `subsample` | 1.0 | 0.75 |
+| `min_samples_leaf` | 10 | 20 |
+| `min_samples_split` | (default) | 30 |
+| `max_features` | (default, all) | sqrt |
+
+| Metric | Tuned (original) | Regularised (fixed) | Change |
+|---|---|---|---|
+| Train F1 | 1.0000 | 0.9771 | smaller train/CV gap, as intended |
+| Test F1 | **0.9400** | 0.9163 | **−0.0237** |
+| Test AUC | 0.9354 | 0.9102 | −0.0252 |
+| Test Accuracy | 0.9124 | 0.8759 | −0.0365 |
+
+**Result: the regularisation made the model more conservative but measurably worse on the held-out test set.** This is a genuinely useful negative result — it shows the original "overfit-looking" model actually generalised better in practice, and that the regularised version was carried forward only into the ensemble (for variance-reduction reasons), not adopted as the standalone best model.
 
 ---
 
@@ -238,11 +266,15 @@ Decision threshold: 0.56 (optimised on validation set)
 
 2. **SVM with SMOTE produces miscalibrated probabilities** — the optimal threshold shifts to 0.69 (far from default 0.50), indicating the model learned an overly confident positive class bias.
 
-3. **Wide hyperparameter search overfits on small datasets** — a 60-iteration unconstrained search on 692 samples degrades test performance despite improving CV F1. Constrained 25-iteration search is more reliable.
+3. **A "fix" for an apparent overfitting gap backfired.** The tuned Gradient Boosting model's learning curve showed a training/CV gap, so it was re-trained with heavier regularisation (`max_depth` 5→3, `subsample` 1.0→0.75, `min_samples_leaf` 10→20, `max_features='sqrt'`). On the held-out test set this *reduced* performance (F1: 0.9400 → 0.9163, AUC: 0.9354 → 0.9102) instead of improving it. The lesson: a train/CV gap on its own doesn't prove the model is overfitting in a way that hurts test generalisation — the held-out test set is the only reliable arbiter, and a "fix" should be validated against it before being adopted.
 
-4. **Ensemble reduces false negatives** — from 5 (baseline SVM) to 4 (Ensemble), catching one more crossing pedestrian.
+4. **The ensemble does not beat the best individual model.** Because the regularised (weaker) GB was substituted into the ensemble instead of the original tuned GB, the final soft-voting ensemble reaches F1 = 0.9366 — slightly *below* the standalone tuned Gradient Boosting model's F1 = 0.9400. The tuned GB, not the ensemble, is the model actually saved as the project's deployable artifact (`best_model_tuned.pkl`).
 
-5. **Behavioral cues (looking flag, gesture, phone) add marginal noise** — on this 685-sample dataset, these features slightly hurt F1. They may be beneficial on larger datasets.
+5. **Threshold tuning is not a free lunch.** Optimising the ensemble's decision threshold on the validation set (0.58) very slightly *reduces* test F1 (0.9366 → 0.9353) relative to the default threshold (0.50) — a small but real sign of threshold overfitting to the 69-sample validation set.
+
+6. **Wide hyperparameter search overfits on small datasets** — a 60-iteration unconstrained search on 692 samples degrades test performance despite improving CV F1. Constrained 25-iteration search is more reliable.
+
+7. **Behavioral cues (looking flag, gesture, phone) add marginal noise** — on this 685-sample dataset, these features slightly hurt F1. They may be beneficial on larger datasets.
 
 ---
 
