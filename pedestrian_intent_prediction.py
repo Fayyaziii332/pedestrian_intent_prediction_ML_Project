@@ -9,7 +9,9 @@ Students: Fayyaz Hussain Shah and Rafay Saif
 
 Task    : Binary classification — Will a pedestrian cross in the next 1-2s?
 Dataset : JAAD 2.0 — 685 pedestrians, 320 videos, 72.3% crossing
-Best    : Ensemble (soft-vote, val-weighted) — F1=0.9406 | AUC=0.9168
+Best    : Gradient Boosting (tuned, non-regularised) — F1=0.9400 | AUC=0.9354
+          (the standalone tuned GB beats the ensemble; see step 15/17 below
+          and the saved artifact in outputs/best_model_tuned.pkl)
 
 Pipeline:
   1.  Setup & Imports
@@ -26,8 +28,9 @@ Pipeline:
   12. Hyperparameter Tuning — SVM   (GridSearchCV)
   13. Hyperparameter Tuning — RF    (RandomizedSearchCV)
   14. Hyperparameter Tuning — GB    (RandomizedSearchCV)
-  15. Ensemble + Threshold Optimisation
-  16. Final Results Summary & Comparison
+  15. Gradient Boosting Regularisation Experiment (negative result — see below)
+  16. Ensemble + Threshold Optimisation (ensemble uses the regularised GB)
+  17. Final Results Summary & Comparison
 
 Usage:
     python pedestrian_intent_prediction.py
@@ -35,12 +38,22 @@ Usage:
 
 Outputs:
     outputs/best_model.pkl        — baseline SVM model artifact
-    outputs/best_model_tuned.pkl  — tuned Ensemble model artifact
-    outputs/*.png                 — 16 visualisation figures
+    outputs/best_model_tuned.pkl  — tuned model artifact (Gradient Boosting,
+                                     the highest-scoring individual model —
+                                     NOT the ensemble; see step 17.4)
+    outputs/*.png                 — 18 visualisation figures
 
 Results:
-    Baseline best : SVM (RBF)   F1=0.9353  AUC=0.9244
-    Tuned best    : Ensemble     F1=0.9406  AUC=0.9168
+    Baseline best    : SVM (RBF)                          F1=0.9353  AUC=0.9244
+    Tuned best (ind.): Gradient Boosting (non-regularised) F1=0.9400  AUC=0.9354
+    Ensemble (reg.GB): Soft-vote                            F1=0.9366  AUC=0.9155
+
+    Step 15 finding: regularising Gradient Boosting to shrink its train/CV
+    learning-curve gap REDUCED test F1 (0.9400 -> 0.9163), i.e. below even the
+    plain default-hyperparameter GB baseline (0.9347). A visible learning-curve
+    gap is not, by itself, evidence that a model is overfitting in a way that
+    hurts test-set generalisation — the regularised GB is kept only as the
+    ensemble's third member, not adopted as the standalone best model.
 """
 
 
@@ -1172,27 +1185,181 @@ plt.show()
 
 
 #=============================================================================
-# SECTION 15: ENSEMBLE + THRESHOLD OPTIMISATION
+# SECTION 15: GRADIENT BOOSTING REGULARISATION EXPERIMENT
 #=============================================================================
 
-# 15.1  Soft-Voting Ensemble -- weights proportional to val F1
+# 15.1  Fixed Gradient Boosting -- regularised to address the train/CV gap
+#       seen in the Section 14.2 learning curve.
+#       Old params: n_estimators=150, lr=0.12, depth=5, subsample=1.0, leaf=10
+#       Problems  : depth=5 too deep, subsample=1.0 no stochasticity, leaf=10 too small
+gb_fixed = GradientBoostingClassifier(
+    n_estimators     = 100,    # was 150  -> fewer boosting rounds
+    learning_rate    = 0.10,   # was 0.12 -> slightly slower learning
+    max_depth        = 3,      # was 5    -> shallower trees, less memorisation
+    subsample        = 0.75,   # was 1.0  -> KEY FIX: stochastic GB breaks memorisation
+    min_samples_leaf = 20,     # was 10   -> needs 20 samples per leaf (more generalised)
+    min_samples_split= 30,     # new      -> needs 30 samples to make any split
+    max_features      = 'sqrt',# new      -> random feature subset per split
+    random_state      = 42
+)
+gb_fixed.fit(Xe_train, ye_train)
+
+y_pred_fixed  = gb_fixed.predict(Xe_test)
+y_proba_fixed = gb_fixed.predict_proba(Xe_test)[:, 1]
+
+f1_fixed  = f1_score(ye_test, y_pred_fixed)
+acc_fixed = accuracy_score(ye_test, y_pred_fixed)
+auc_fixed = roc_auc_score(ye_test, y_proba_fixed)
+
+print("GB Fixed (regularised) Results:")
+print(f"  F1  : {f1_fixed:.4f}  (tuned, non-regularised was 0.9400)")
+print(f"  Acc : {acc_fixed:.4f}  (tuned, non-regularised was 0.9124)")
+print(f"  AUC : {auc_fixed:.4f}  (tuned, non-regularised was 0.9354)")
+
+# 15.2  Learning curve comparison -- tuned (overfit-looking) vs regularised
+fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+for ax, (model, title, col_tr, col_cv) in zip(axes, [
+    (best_gb,  "GB Original (overfit)",  "#534AB7", "#CC4F1B"),
+    (gb_fixed, "GB Fixed (regularised)", "#1D9E75", "#D85A30"),
+]):
+    train_sizes, train_scores, cv_scores = learning_curve(
+        model, Xe_train, ye_train,
+        cv=StratifiedKFold(5, shuffle=True, random_state=42),
+        scoring="f1", n_jobs=-1,
+        train_sizes=np.linspace(0.08, 1.0, 10))
+    tr_mean, tr_std = train_scores.mean(axis=1), train_scores.std(axis=1)
+    cv_mean, cv_std = cv_scores.mean(axis=1), cv_scores.std(axis=1)
+
+    ax.plot(train_sizes, tr_mean, "o-", color=col_tr, lw=2.5, label="Train F1")
+    ax.fill_between(train_sizes, tr_mean - tr_std, tr_mean + tr_std, alpha=0.15, color=col_tr)
+    ax.plot(train_sizes, cv_mean, "s-", color=col_cv, lw=2.5, label="CV Val F1")
+    ax.fill_between(train_sizes, cv_mean - cv_std, cv_mean + cv_std, alpha=0.15, color=col_cv)
+
+    gap = tr_mean[-1] - cv_mean[-1]
+    ax.annotate(f"Gap: {gap:.3f}",
+                xy=(train_sizes[-1], (tr_mean[-1] + cv_mean[-1]) / 2),
+                xytext=(-80, 0), textcoords="offset points",
+                fontsize=10, color="gray",
+                arrowprops=dict(arrowstyle="->", color="gray"))
+    ax.set_ylim(0.70, 1.02)
+    ax.set_xlabel("Training samples", fontsize=12)
+    ax.set_ylabel("F1 Score", fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
+
+plt.suptitle("Learning Curve Comparison -- Before vs After Regularisation",
+             fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "14b_learning_curve_fixed.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print()
+print("=" * 55)
+print("Learning Curve Comparison")
+print("=" * 55)
+print(f"{'Metric':<30} {'Original':>10} {'Fixed':>10}")
+print("-" * 55)
+tr_s, tr_sc, _ = learning_curve(gb_fixed, Xe_train, ye_train, cv=5,
+                                 scoring="f1", train_sizes=[1.0])
+print(f"{'Train F1 (all samples)':<30} {'1.0000':>10} {tr_sc.mean():>10.4f}")
+print(f"{'Test F1':<30} {'0.9400':>10} {f1_fixed:>10.4f}")
+print(f"{'Test AUC':<30} {'0.9354':>10} {auc_fixed:>10.4f}")
+print("=" * 55)
+
+# Store fixed-GB results dict for the summary table + ensemble
+f1_val_fixed = f1_score(ye_val, gb_fixed.predict(Xe_val))
+gb_fixed_res = {
+    "acc":    acc_fixed,
+    "f1":     f1_fixed,
+    "f1_val": f1_val_fixed,
+    "auc":    auc_fixed,
+    "cv_f1":  gb_tuned["cv_f1"],   # CV-F1 from the original RandomizedSearch
+}
+print(f"Val F1 (fixed GB): {f1_val_fixed:.4f}")
+
+# 15.3  Three-way comparison: default vs tuned (overfit) vs regularised
+kf = StratifiedKFold(5, shuffle=True, random_state=42)
+configs = [
+    (GradientBoostingClassifier(random_state=42),
+     "GB Baseline (default params)\ndepth=3, n=100, subsample=1.0",
+     "#aaaaaa", "#888888"),
+    (GradientBoostingClassifier(
+        n_estimators=150, learning_rate=0.12, max_depth=5,
+        subsample=1.0, min_samples_leaf=10, random_state=42),
+     "GB Tuned (overfit)\ndepth=5, n=150, subsample=1.0",
+     "#534AB7", "#CC4F1B"),
+    (GradientBoostingClassifier(
+        n_estimators=100, learning_rate=0.10, max_depth=3,
+        subsample=0.75, min_samples_leaf=20,
+        min_samples_split=30, max_features="sqrt", random_state=42),
+     "GB Regularised (fixed)\ndepth=3, n=100, subsample=0.75",
+     "#1D9E75", "#D85A30"),
+]
+
+fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+for ax, (model, title, c_tr, c_cv) in zip(axes, configs):
+    model.fit(Xe_train, ye_train)
+    sz, tr_sc3, cv_sc3 = learning_curve(
+        model, Xe_train, ye_train, cv=kf, scoring="f1", n_jobs=-1,
+        train_sizes=np.linspace(0.08, 1.0, 10))
+    tr_m, cv_m = tr_sc3.mean(1), cv_sc3.mean(1)
+    ax.plot(sz, tr_m, "o-", color=c_tr, lw=2.5, label="Train F1")
+    ax.plot(sz, cv_m, "s-", color=c_cv, lw=2.5, label="CV Val F1")
+    ax.fill_between(sz, cv_m - cv_sc3.std(1), cv_m + cv_sc3.std(1), alpha=0.15, color=c_cv)
+    gap = tr_m[-1] - cv_m[-1]
+    ax.annotate(f"Gap={gap:.3f}",
+                xy=(sz[-1], (tr_m[-1] + cv_m[-1]) / 2),
+                xytext=(-90, 0), textcoords="offset points",
+                fontsize=10, color="gray",
+                arrowprops=dict(arrowstyle="->", color="gray"))
+    te_f1 = f1_score(ye_test, model.predict(Xe_test))
+    ax.set_ylim(0.70, 1.03)
+    ax.set_title(f"{title}\nTest F1={te_f1:.4f}", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Training samples", fontsize=11)
+    ax.set_ylabel("F1 Score", fontsize=11)
+    ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+
+plt.suptitle("GB Learning Curves -- Baseline vs Tuned vs Regularised",
+             fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "14c_gb_three_way_comparison.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print()
+print("RESULT: regularisation narrowed the train/CV gap as intended, but it")
+print("also LOWERED test F1 (0.9400 -> {:.4f}), even below the plain default".format(f1_fixed))
+print("GB baseline (F1=0.9347). A visible learning-curve gap is therefore NOT")
+print("by itself proof that a model is overfitting in a way that hurts test-set")
+print("generalisation -- the held-out test set must be the final check before")
+print("a regularisation 'fix' is adopted. gb_tuned (the non-regularised model)")
+print("remains the best individual model and is the one saved as the project's")
+print("deployable artifact (Section 17.4); gb_fixed is used only as the third")
+print("ensemble member below, as a deliberate lower-variance choice.")
+
+
+#=============================================================================
+# SECTION 16: ENSEMBLE + THRESHOLD OPTIMISATION
+#=============================================================================
+
+# 16.1  Soft-Voting Ensemble -- uses gb_fixed (regularised GB), not best_gb
 from sklearn.ensemble import VotingClassifier
 
 w_svm = svm_tuned["f1_val"]
 w_rf  = rf_tuned["f1_val"]
-w_gb  = gb_tuned["f1_val"]
+w_gb  = gb_fixed_res["f1_val"]    # use fixed-GB val F1 for weighting
 total = w_svm + w_rf + w_gb
-ens_weights = [w_svm/total, w_rf/total, w_gb/total]
-print("Ensemble weights (by val F1):  SVM={:.3f}  RF={:.3f}  GB={:.3f}".format(
-    *ens_weights))
+ens_weights = [w_svm / total, w_rf / total, w_gb / total]
+print("Ensemble weights:  SVM={:.3f}  RF={:.3f}  GB(fixed)={:.3f}".format(*ens_weights))
 
+# VotingClassifier retrains all estimators on Xe_train.
+# gb_fixed's hyperparameters (depth=3, subsample=0.75) provide regularisation.
 ensemble = VotingClassifier(
-    estimators=[("svm", best_svm), ("rf", best_rf), ("gb", best_gb)],
+    estimators=[("svm", best_svm), ("rf", best_rf), ("gb", gb_fixed)],
     voting="soft", weights=ens_weights, n_jobs=-1)
 ensemble.fit(Xe_train, ye_train)
 
 y_pred_ens  = ensemble.predict(Xe_test)
-y_proba_ens = ensemble.predict_proba(Xe_test)[:,1]
+y_proba_ens = ensemble.predict_proba(Xe_test)[:, 1]
 ens_res = {
     "acc":    accuracy_score(ye_test, y_pred_ens),
     "f1":     f1_score(ye_test, y_pred_ens),
@@ -1200,17 +1367,18 @@ ens_res = {
     "f1_val": f1_score(ye_val, ensemble.predict(Xe_val)),
     "cv_f1":  None,
 }
-print("Soft-Voting Ensemble (val-weighted):")
+print("Soft-Voting Ensemble (val-weighted, regularised GB):")
 print("  Acc={:.4f}  F1={:.4f}  ValF1={:.4f}  AUC={:.4f}".format(
     ens_res["acc"], ens_res["f1"], ens_res["f1_val"], ens_res["auc"]))
+print("  Note: this is BELOW the standalone tuned GB (F1=0.9400) -- see Section 15.")
 
-# 15.2  Threshold optimisation
+# 16.2  Threshold optimisation
 def opt_threshold(model, Xv, yv, Xt, yt):
-    y_pv   = model.predict_proba(Xv)[:,1]
+    y_pv   = model.predict_proba(Xv)[:, 1]
     ths    = np.linspace(0.20, 0.80, 61)
     f1s    = [f1_score(yv, (y_pv >= t).astype(int)) for t in ths]
     t_best = ths[int(np.argmax(f1s))]
-    y_pt   = model.predict_proba(Xt)[:,1]
+    y_pt   = model.predict_proba(Xt)[:, 1]
     y_opt  = (y_pt >= t_best).astype(int)
     return t_best, f1_score(yt, y_opt), accuracy_score(yt, y_opt), roc_auc_score(yt, y_pt)
 
@@ -1218,124 +1386,133 @@ print("\nThreshold-optimised results (threshold found on val, applied to test):"
 thr_res = {}
 for label, model in [("SVM (tuned)", best_svm),
                       ("RF (tuned)",  best_rf),
-                      ("GB (tuned)",  best_gb),
+                      ("GB (fixed)",  gb_fixed),
                       ("Ensemble",    ensemble)]:
     t, f1o, acco, auco = opt_threshold(model, Xe_val, ye_val, Xe_test, ye_test)
     thr_res[label] = {"t": t, "f1": f1o, "acc": acco, "auc": auco}
     print("  {:<22}  threshold={:.2f}  F1={:.4f}  Acc={:.4f}".format(
         label, t, f1o, acco))
 
-# 15.3  Threshold sweep plot
+# 16.3  Threshold sweep plot
+# Note: plotted against best_gb (the originally tuned, non-regularised model)
+# for visual comparability with Section 14; Table 7-equivalent numbers above
+# use gb_fixed, which is the model actually inside the ensemble.
 ths_plot = np.linspace(0.20, 0.80, 61)
 fig, ax  = plt.subplots(figsize=(10, 5))
 for (label, model), color in zip(
-    [("SVM (tuned)",best_svm),("RF (tuned)",best_rf),
-     ("GB (tuned)",best_gb),("Ensemble",ensemble)], PALETTE):
-    y_pv = model.predict_proba(Xe_val)[:,1]
-    f1s  = [f1_score(ye_val,(y_pv>=t).astype(int)) for t in ths_plot]
+    [("SVM (tuned)", best_svm), ("RF (tuned)", best_rf),
+     ("GB (tuned)", best_gb), ("Ensemble", ensemble)], PALETTE):
+    y_pv = model.predict_proba(Xe_val)[:, 1]
+    f1s  = [f1_score(ye_val, (y_pv >= t).astype(int)) for t in ths_plot]
     ax.plot(ths_plot, f1s, "-", color=color, lw=2.2, label=label)
     bt = ths_plot[int(np.argmax(f1s))]
     ax.axvline(bt, color=color, ls=":", lw=1.0, alpha=0.6)
 ax.axvline(0.5, color="gray", ls="--", lw=1.2, alpha=0.5, label="Default (0.5)")
 ax.set_xlabel("Decision Threshold", fontsize=12)
 ax.set_ylabel("F1 Score (Validation)", fontsize=12)
-ax.set_title("Threshold Optimisation — Val F1 vs Threshold", fontsize=13, fontweight="bold")
+ax.set_title("Threshold Optimisation -- Val F1 vs Threshold", fontsize=13, fontweight="bold")
 ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.savefig(OUT_DIR/"15_threshold_opt.png", dpi=150, bbox_inches="tight")
+plt.savefig(OUT_DIR / "15_threshold_opt.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 
 #=============================================================================
-# SECTION 16: FINAL RESULTS SUMMARY
+# SECTION 17: FINAL RESULTS SUMMARY
 #=============================================================================
+# Original pipeline : 27 base features, StandardScaler, SMOTE, default params
+# Enhanced pipeline  : 43 features -> 32 selected (top by RF importance),
+#                      StandardScaler, SMOTE, constrained Grid/RandomizedSearch
+#                      + soft-vote ensemble (using the regularised GB)
+#
+# Key result: the best INDIVIDUAL model is Gradient Boosting (tuned,
+# non-regularised) at F1=0.9400 -- this is the model saved as the project's
+# deployable artifact. The ensemble (built around the regularised GB) reaches
+# F1=0.9366: an improvement over the original baseline GB (0.9347) but
+# slightly BELOW the standalone tuned GB. See Section 15 for why.
 
-# 16.1  Summary table
+# 17.1  Summary table
 SEP = "=" * 78
 
 ORIG = {
-    "SVM (original)":           {"acc":0.9051,"f1":0.9353,"f1_val":0.9000,"auc":0.9244,"cv_f1":0.9230},
-    "Random Forest (original)": {"acc":0.9051,"f1":0.9353,"f1_val":0.9091,"auc":0.9213,"cv_f1":0.9157},
-    "Grad. Boosting (original)":{"acc":0.9051,"f1":0.9347,"f1_val":0.8889,"auc":0.9288,"cv_f1":0.9259},
+    "SVM (original)":            {"acc": 0.9051, "f1": 0.9353, "f1_val": 0.9000, "auc": 0.9244, "cv_f1": 0.9230},
+    "Random Forest (original)":  {"acc": 0.9051, "f1": 0.9353, "f1_val": 0.9091, "auc": 0.9213, "cv_f1": 0.9157},
+    "Grad. Boosting (original)": {"acc": 0.9051, "f1": 0.9347, "f1_val": 0.8889, "auc": 0.9288, "cv_f1": 0.9259},
 }
 TUNED = {
-    "SVM (tuned+feat.)":             dict(**svm_tuned),
-    "Random Forest (tuned+feat.)":  dict(**rf_tuned),
-    "Grad. Boosting (tuned+feat.)": dict(**gb_tuned),
-    "Ensemble (soft-vote)":          dict(**ens_res),
+    "SVM (tuned+feat.)":                   dict(**svm_tuned),
+    "Random Forest (tuned+feat.)":         dict(**rf_tuned),
+    "Grad. Boosting (tuned, non-reg.)":    dict(**gb_tuned),       # best individual model
+    "Grad. Boosting (regularised+feat.)":  dict(**gb_fixed_res),   # used inside the ensemble
+    "Ensemble (soft-vote, reg. GB)":       dict(**ens_res),
 }
 
-header = "{:<36} {:>7} {:>9} {:>8} {:>8} {:>8}".format(
+header = "{:<40} {:>7} {:>9} {:>8} {:>8} {:>8}".format(
     "Model", "Acc", "F1(test)", "F1(val)", "AUC", "CV-F1")
 print(SEP)
 print(header)
 print(SEP)
-for name, r in list(ORIG.items()) + list(TUNED.items()):
+print("-- Baseline (27 features, default params) --")
+for name, r in ORIG.items():
+    cv = "{:.4f}".format(r["cv_f1"])
+    print("{:<40} {:.4f}  {:.4f}   {:.4f}  {:.4f} {}".format(
+        name, r["acc"], r["f1"], r["f1_val"], r["auc"], cv))
+print("-- Enhanced (32/43 features, tuned + regularised) --")
+for name, r in TUNED.items():
     cv = "{:.4f}".format(r["cv_f1"]) if r.get("cv_f1") is not None else "  ----"
-    print("{:<36} {:.4f}  {:.4f}   {:.4f}  {:.4f} {}".format(
+    print("{:<40} {:.4f}  {:.4f}   {:.4f}  {:.4f} {}".format(
         name, r["acc"], r["f1"], r["f1_val"], r["auc"], cv))
 print(SEP)
+print("\nBest individual model : Gradient Boosting (tuned, non-regularised), F1=0.9400")
+print("Best ensemble model    : Soft-vote (reg. GB), F1={:.4f}  (does not exceed best individual)".format(ens_res["f1"]))
 
-print("\nBest threshold-optimised F1 (test):")
+print("\nThreshold-optimised results (test):")
 for k, v in thr_res.items():
     print("  {:<22}  t={:.2f}  F1={:.4f}".format(k, v["t"], v["f1"]))
 
-# 16.2  Bar chart: original vs tuned (F1 and AUC)
-labels3   = ["SVM", "Random Forest", "Grad. Boosting"]
-orig_keys = ["SVM (original)", "Random Forest (original)", "Grad. Boosting (original)"]
-tuned_keys= ["SVM (tuned+feat.)", "Random Forest (tuned+feat.)", "Grad. Boosting (tuned+feat.)"]
+# 17.2  Bar chart: original vs tuned+regularised (F1 and AUC)
+labels3    = ["SVM", "Random Forest", "Grad. Boosting"]
+orig_keys  = ["SVM (original)", "Random Forest (original)", "Grad. Boosting (original)"]
+tuned_keys = ["SVM (tuned+feat.)", "Random Forest (tuned+feat.)", "Grad. Boosting (regularised+feat.)"]
 
 orig_f1   = [ORIG[k]["f1"]  for k in orig_keys]
 tuned_f1  = [TUNED[k]["f1"] for k in tuned_keys]
 orig_auc  = [ORIG[k]["auc"] for k in orig_keys]
-tuned_auc = [TUNED[k]["auc"]for k in tuned_keys]
+tuned_auc = [TUNED[k]["auc"] for k in tuned_keys]
 
 x = np.arange(3)
 w = 0.35
 fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-for ax, ov, tv, metric in zip(
-    axes,
-    [orig_f1,  orig_auc],
-    [tuned_f1, tuned_auc],
-    ["F1 Score (test)", "ROC-AUC"]
-):
-    b1 = ax.bar(x - w/2, ov, w, color="#aaaaaa", alpha=0.75,
-                edgecolor="white", label="Original")
-    b2 = ax.bar(x + w/2, tv, w, color="#534AB7", alpha=0.90,
-                edgecolor="white", label="Tuned+Feat.Eng.")
-    ax.set_ylim(0.85, 1.03)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels3, fontsize=10)
+for ax, ov, tv, metric in zip(axes, [orig_f1, orig_auc], [tuned_f1, tuned_auc],
+                               ["F1 Score (test)", "ROC-AUC"]):
+    b1 = ax.bar(x - w/2, ov, w, color="#aaaaaa", alpha=0.75, edgecolor="white", label="Original")
+    b2 = ax.bar(x + w/2, tv, w, color="#534AB7", alpha=0.90, edgecolor="white", label="Tuned+Regularised")
+    ax.set_ylim(0.85, 1.00)
+    ax.set_xticks(x); ax.set_xticklabels(labels3, fontsize=10)
     ax.set_title(metric, fontsize=12, fontweight="bold")
     ax.legend(fontsize=9)
     for bar in b2:
-        ax.text(bar.get_x() + bar.get_width()/2,
-                bar.get_height() + 0.003,
-                "{:.4f}".format(bar.get_height()),
-                ha="center", va="bottom",
-                fontsize=8, fontweight="bold", color="#534AB7")
-
-plt.suptitle("Original vs Hyperparameter-Tuned + Feature-Engineered Models",
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+                 "{:.4f}".format(bar.get_height()), ha="center", va="bottom",
+                 fontsize=8, fontweight="bold", color="#534AB7")
+plt.suptitle("Original vs Hyperparameter-Tuned + Regularised Models",
              fontsize=12, fontweight="bold", y=1.02)
 plt.tight_layout()
-plt.savefig(OUT_DIR/"16_orig_vs_tuned_bar.png", dpi=150, bbox_inches="tight")
+plt.savefig(OUT_DIR / "16_orig_vs_tuned_bar.png", dpi=150, bbox_inches="tight")
 plt.show()
 
-# 16.3  ROC comparison: dashed = original, solid = tuned
-# y_test == ye_test (same random_state=42 -> same samples) so original y_proba is valid
+# 17.3  ROC comparison: dashed = original, solid = tuned/regularised
 fig, ax = plt.subplots(figsize=(9, 7))
-
 orig_pairs = [
     ("SVM (original)", results["SVM (RBF kernel)"]["y_proba"]),
     ("RF (original)",  results["Random Forest"]["y_proba"]),
     ("GB (original)",  results["Gradient Boosting"]["y_proba"]),
 ]
 tuned_pairs = [
-    ("SVM (tuned)",  y_proba_svm),
-    ("RF (tuned)",   y_proba_rf),
-    ("GB (tuned)",   y_proba_gb),
-    ("Ensemble",     y_proba_ens),
+    ("SVM (tuned)",        y_proba_svm),
+    ("RF (tuned)",         y_proba_rf),
+    ("GB (fixed/reg.)",    y_proba_fixed),    # regularised GB
+    ("Ensemble (reg. GB)", y_proba_ens),
 ]
 orig_colors  = ["#aaaaaa", "#bbbbbb", "#cccccc"]
 tuned_colors = ["#534AB7", "#1D9E75", "#D85A30", "#BA7517"]
@@ -1343,88 +1520,70 @@ tuned_colors = ["#534AB7", "#1D9E75", "#D85A30", "#BA7517"]
 for (nm, yp), col in zip(orig_pairs, orig_colors):
     fpr, tpr, _ = roc_curve(y_test, yp)
     auc_v = roc_auc_score(y_test, yp)
-    ax.plot(fpr, tpr, "--", color=col, lw=1.5, alpha=0.7,
-            label="{} AUC={:.3f}".format(nm, auc_v))
-
+    ax.plot(fpr, tpr, "--", color=col, lw=1.5, alpha=0.7, label="{} AUC={:.3f}".format(nm, auc_v))
 for (nm, yp), col in zip(tuned_pairs, tuned_colors):
     fpr, tpr, _ = roc_curve(ye_test, yp)
     auc_v = roc_auc_score(ye_test, yp)
-    ax.plot(fpr, tpr, "-", color=col, lw=2.3,
-            label="{} AUC={:.3f}".format(nm, auc_v))
-
-ax.plot([0,1],[0,1], "k--", lw=1, alpha=0.3)
+    ax.plot(fpr, tpr, "-", color=col, lw=2.3, label="{} AUC={:.3f}".format(nm, auc_v))
+ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.3)
 ax.set_xlabel("False Positive Rate", fontsize=12)
-ax.set_ylabel("True Positive Rate",  fontsize=12)
-ax.set_title("ROC Curves: Original (dashed) vs Tuned+Enhanced (solid)",
+ax.set_ylabel("True Positive Rate", fontsize=12)
+ax.set_title("ROC Curves: Original (dashed) vs Tuned+Regularised (solid)",
              fontsize=13, fontweight="bold")
 ax.legend(fontsize=8, loc="lower right")
 plt.tight_layout()
-plt.savefig(OUT_DIR/"16_roc_comparison.png", dpi=150, bbox_inches="tight")
+plt.savefig(OUT_DIR / "16_roc_comparison.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 
 #-----------------------------------------------------------
-# 16.3b — Confusion Matrices: GB Tuned + Ensemble
+# 17.3b -- Confusion Matrices: GB Fixed (regularised) + Ensemble
 #-----------------------------------------------------------
-
-# Confusion matrices for best tuned models (GB tuned + Ensemble)
+# False Negatives (missed crossers) are the safety-critical error.
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
-# --- GB Tuned (default threshold 0.5, F1=0.9400) ---
-cm_gb  = confusion_matrix(ye_test, y_pred_gb)
+# --- GB Fixed (regularised, default threshold 0.5) ---
+cm_gb = confusion_matrix(ye_test, y_pred_fixed)
 tn_gb, fp_gb, fn_gb, tp_gb = cm_gb.ravel()
-
-disp_gb = ConfusionMatrixDisplay(
-    cm_gb, display_labels=['Will Stay', 'Will Cross'])
-disp_gb.plot(ax=axes[0], colorbar=False,
-             cmap='Blues', values_format='d')
+disp_gb = ConfusionMatrixDisplay(cm_gb, display_labels=["Will Stay", "Will Cross"])
+disp_gb.plot(ax=axes[0], colorbar=False, cmap="Blues", values_format="d")
 axes[0].set_title(
-    f'Gradient Boosting (tuned)  F1=0.9400  AUC=0.9354\n'
-    f'False Negatives (missed crossers): {fn_gb}  '
-    f'False Positives (false alarms): {fp_gb}',
-    fontsize=10, fontweight='bold')
+    f"Gradient Boosting (regularised)  F1={f1_fixed:.4f}  AUC={auc_fixed:.4f}\n"
+    f"False Negatives (missed crossers): {fn_gb}  False Positives (false alarms): {fp_gb}",
+    fontsize=10, fontweight="bold")
 
-# --- Ensemble at optimal threshold 0.56 (F1=0.9406) ---
-y_pred_ens_thr = (y_proba_ens >= 0.56).astype(int)
-cm_ens  = confusion_matrix(ye_test, y_pred_ens_thr)
+# --- Ensemble (regularised GB, optimal validation threshold) ---
+thr_ens    = thr_res.get("Ensemble", {}).get("t", 0.5)
+y_pred_et  = (y_proba_ens >= thr_ens).astype(int)
+cm_ens     = confusion_matrix(ye_test, y_pred_et)
 tn_en, fp_en, fn_en, tp_en = cm_ens.ravel()
-
-disp_en = ConfusionMatrixDisplay(
-    cm_ens, display_labels=['Will Stay', 'Will Cross'])
-disp_en.plot(ax=axes[1], colorbar=False,
-             cmap='Greens', values_format='d')
+f1_ens_val = thr_res.get("Ensemble", {}).get("f1", ens_res["f1"])
+disp_en = ConfusionMatrixDisplay(cm_ens, display_labels=["Will Stay", "Will Cross"])
+disp_en.plot(ax=axes[1], colorbar=False, cmap="Greens", values_format="d")
 axes[1].set_title(
-    f'Ensemble (soft-vote, thr=0.56)  F1=0.9406  AUC=0.9168\n'
-    f'False Negatives (missed crossers): {fn_en}  '
-    f'False Positives (false alarms): {fp_en}',
-    fontsize=10, fontweight='bold')
+    f"Ensemble (soft-vote, reg. GB, thr={thr_ens:.2f})  F1={f1_ens_val:.4f}  AUC={ens_res['auc']:.4f}\n"
+    f"False Negatives (missed crossers): {fn_en}  False Positives (false alarms): {fp_en}",
+    fontsize=10, fontweight="bold")
 
-plt.suptitle(
-    'Confusion Matrices — Best Tuned Models  |  '
-    'Test set: 137 samples (99 Cross / 38 Stay)',
-    fontsize=13, fontweight='bold')
+plt.suptitle("Confusion Matrices -- Regularised Models  |  Test set: 137 samples (99 Cross / 38 Stay)",
+             fontsize=13, fontweight="bold")
 plt.tight_layout()
-
-out_path = OUT_DIR / '17_tuned_confusion_matrices.png'
-plt.savefig(out_path, dpi=150, bbox_inches='tight')
+plt.savefig(OUT_DIR / "17_tuned_confusion_matrices.png", dpi=150, bbox_inches="tight")
 plt.show()
 
-# Safety summary
-print('Safety Summary (Test Set: 99 actual crossers / 38 stayers)')
-print('=' * 60)
-print(f'GB (tuned)  :  Missed {fn_gb} crossers'
-      f'  ({fn_gb/99*100:.1f}% miss rate)  '
-      f'{fp_gb} false alarms')
-print(f'Ensemble    :  Missed {fn_en} crossers'
-      f'  ({fn_en/99*100:.1f}% miss rate)  '
-      f'{fp_en} false alarms')
-print('=' * 60)
-print('Baseline SVM: Missed 5 crossers (5.1% miss rate)  8 false alarms')
-print(f'Improvement : {5 - fn_en} fewer missed crossing(s) vs baseline')
+print("Safety Summary (Test Set: 99 actual crossers / 38 stayers)")
+print("=" * 65)
+print(f"Baseline SVM     :  Missed 5  (5.1% miss rate)   8 false alarms")
+print(f"GB (regularised) :  Missed {fn_gb} crossers ({fn_gb/99*100:.1f}% miss rate)  {fp_gb} false alarms")
+print(f"Ensemble (reg.)  :  Missed {fn_en} crossers ({fn_en/99*100:.1f}% miss rate)  {fp_en} false alarms")
+print("=" * 65)
 
-# 16.4  Save best tuned model
+# 17.4  Save best tuned model
+# NOTE: this selects the model with the HIGHEST test F1 among all candidates.
+# Because gb_tuned (the original, non-regularised GB) outscores the ensemble,
+# IT is the model that actually gets saved here -- not the ensemble.
 candidates = [
     ("SVM (tuned)",  best_svm,  svm_tuned["f1"]),
     ("RF (tuned)",   best_rf,   rf_tuned["f1"]),
@@ -1436,8 +1595,8 @@ best_name_t, best_model_t, best_f1_t = max(candidates, key=lambda x: x[2])
 artifact_tuned = {
     "model":         best_model_t,
     "scaler":        scaler_e,              # StandardScaler fitted on train
-    "feature_names": SELECTED_FEATURES,    # top-32 selected features
-    "top_idx":       top_idx,              # column indices into ENH_FEATURES
+    "feature_names": SELECTED_FEATURES,     # top-32 selected features
+    "top_idx":       top_idx,               # column indices into ENH_FEATURES
     "best_name":     best_name_t,
     "n_features":    len(SELECTED_FEATURES),
     "base_features": BASE_FEATURES,
